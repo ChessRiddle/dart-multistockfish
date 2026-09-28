@@ -66,6 +66,8 @@ class Stockfish {
 
   Future<void>? _pendingStart;
   Future<void>? _pendingQuit;
+  bool _nativeSpawned = false;
+  Completer<void>? _nativeExit;
 
   Stockfish._() {
     _mainPort.listen((message) {
@@ -76,7 +78,7 @@ class Stockfish {
     _stdoutPort.listen((message) {
       if (message is String) {
         _logger.finest('[stdout] $message');
-        _stdoutController.sink.add(message);
+        _stdoutController.add(message);
       } else {
         _logger.fine('The stdout isolate sent $message');
       }
@@ -152,35 +154,54 @@ class Stockfish {
   }
 
   Future<void> _doStart() async {
-    final success = await _spawnIsolates(
-      _mainPort.sendPort,
-      _stdoutPort.sendPort,
-      _flavor,
-    );
-
-    if (!success) {
-      _logger.severe('Failed to spawn isolates');
-      _state._setValue(StockfishState.error);
-      throw Exception('Failed to spawn isolates');
-    }
-
+    final banner = Completer<void>();
+    final uciReady = Completer<void>();
+    var uciSent = false;
+    // Native stdout can emit its banner before isolate spawning completes.
+    // Subscribe first, because stdout is a broadcast stream without replay.
+    final startupOutput = stdout.listen((line) {
+      if (line.isNotEmpty && !banner.isCompleted) banner.complete();
+      if (uciSent && line == 'uciok' && !uciReady.isCompleted) {
+        uciReady.complete();
+      }
+    });
     _state._setValue(StockfishState.starting);
-
     try {
-      // Wait for the engine to be ready by checking the first non-empty line (usually its name).
-      await stdout.firstWhere((line) => line.isNotEmpty).timeout(kStartTimeout);
+      _nativeExit = Completer<void>();
+      final success = await _spawnIsolates(
+        _mainPort.sendPort,
+        _stdoutPort.sendPort,
+        _flavor,
+      );
+      if (!success) {
+        _logger.severe('Failed to spawn isolates');
+        _state._setValue(StockfishState.error);
+        throw Exception('Failed to spawn isolates');
+      }
+      _nativeSpawned = _state.value == StockfishState.starting;
+
+      // The first non-empty line is normally the engine name.
+      await banner.future.timeout(kStartTimeout);
+      if (_state.value != StockfishState.starting) {
+        throw StateError('Stockfish exited during startup');
+      }
 
       _state._setValue(StockfishState.ready);
 
       // Switch to the engine to UCI protocol
+      uciSent = true;
       stdin = 'uci';
-      await stdout.firstWhere((line) => line == "uciok").timeout(kStartTimeout);
-    } on TimeoutException {
+      await uciReady.future.timeout(kStartTimeout);
+    } catch (error) {
       _state._setValue(StockfishState.error);
-      _logger.severe(
-        'The engine did not become ready in time (${kStartTimeout.inSeconds}s).',
-      );
+      if (error is TimeoutException) {
+        _logger.severe(
+          'The engine did not become ready in time (${kStartTimeout.inSeconds}s).',
+        );
+      }
       rethrow;
+    } finally {
+      unawaited(startupOutput.cancel());
     }
 
     if (_flavor == StockfishFlavor.variant && _variant != null) {
@@ -209,12 +230,23 @@ class Stockfish {
 
     switch (_state.value) {
       case StockfishState.initial:
-      case StockfishState.error:
         return Future.value();
+      case StockfishState.error:
+        return _pendingQuit = _quitAfterError().whenComplete(
+          () => _pendingQuit = null,
+        );
       case StockfishState.starting:
       case StockfishState.ready:
         return _pendingQuit = _doQuit().whenComplete(() => _pendingQuit = null);
     }
+  }
+
+  Future<void> _quitAfterError() async {
+    if (_nativeSpawned) {
+      _bindings.stdinWrite('quit\n');
+      await _nativeExit!.future.timeout(kStartTimeout);
+    }
+    _state._setValue(StockfishState.initial);
   }
 
   Future<void> _doQuit() {
@@ -236,10 +268,19 @@ class Stockfish {
     if (_state.value == StockfishState.ready) {
       stdin = 'quit';
     }
-    return completer.future;
+    return completer.future.timeout(
+      kStartTimeout,
+      onTimeout: () {
+        _state.removeListener(onStateChange);
+        throw TimeoutException('Stockfish did not exit', kStartTimeout);
+      },
+    );
   }
 
   void _onEngineExit(int exitCode) {
+    _nativeSpawned = false;
+    final nativeExit = _nativeExit;
+    if (nativeExit != null && !nativeExit.isCompleted) nativeExit.complete();
     _state._setValue(
       exitCode == 0 ? StockfishState.initial : StockfishState.error,
     );
@@ -374,7 +415,7 @@ class _StockfishState extends ChangeNotifier
   @override
   StockfishState get value => _value;
 
-  _setValue(StockfishState v) {
+  void _setValue(StockfishState v) {
     if (v == _value) return;
     _value = v;
     notifyListeners();
